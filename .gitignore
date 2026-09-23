@@ -1,0 +1,63 @@
+# ===================== Python =====================
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# ===================== 打包 / 构建产物 =====================
+GPSTool/.build_work/
+GPSTool/.build_work2/
+GPSTool/.dist/
+GPSTool/..build_work/
+GPSTool/..build_work2/
+GPSTool/..dist/
+build/
+build_rebuild/
+dist/
+dist_rebuild/
+out/
+
+# ===================== 内置 Python 运行环境 (166MB) =====================
+# 运行时随发布包分发，源码仓库不纳入
+GPSTool/python/
+
+# ===================== 内置 ffmpeg / ffprobe (162MB) =====================
+# 随 GitHub Release 资产分发，源码仓库不纳入
+GPSTool/tools/
+
+# ===================== 用户配置与各种备份 =====================
+GPSTool/settings.json
+GPSTool/settings.json.*
+GPSTool/*.bak
+GPSTool/work_backup_core_*.py
+
+# ===================== 工作 / 中间产物 (2.4GB) =====================
+work/
+
+# ===================== 发布产物 (783MB，含 EXE + ffmpeg) =====================
+# 作为 GitHub Release 资产分发，不纳入 git
+发布版本/
+
+# ===================== 测试素材 (944MB 视频 / gpx) =====================
+测试视频和轨迹/
+
+# ===================== 需求讨论文档 =====================
+修改要求/
+
+# ===================== 顶层工具目录 (165MB) =====================
+tools/
+
+# ===================== 工作区元数据 =====================
+.workbuddy/
+
+# ===================== 编辑器 / 系统 =====================
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ===================== 开发 / 诊断辅助脚本 =====================
+GPSTool/诊断启动*.bat
+GPSTool/重新打包.bat
