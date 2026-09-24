@@ -630,6 +630,75 @@ class Track:
                  fmt_hms(self.ts[-1] - self.ts[0]), ch))
 
 
+def elevation_gain(tr, thresh: float = 10.0) -> float:
+    """累计爬升（m）：先平滑，再用「回差折线法」只累计超过 thresh 的净爬升段。
+
+    GPS 海拔噪声常有 ±3~5 m 抖动，直接累加正增量会把噪声当成爬升（两小时能虚增数百米）；
+    回差法只在「从阶段低点净上升 ≥ thresh」时结算一段，抖动不会触发，结果与运动 App 接近。
+    """
+    if tr is None or not getattr(tr, "has_ele", False):
+        return 0.0
+    e = tr.ele
+    n = len(e)
+    if n < 3:
+        return 0.0
+    w = 3                                    # 7 点滑动平均
+    sm = []
+    for i in range(n):
+        a, b = max(0, i - w), min(n, i + w + 1)
+        sm.append(sum(e[a:b]) / float(b - a))
+    gain, base, peak = 0.0, sm[0], sm[0]
+    for v in sm[1:]:
+        if v > peak:
+            peak = v
+        elif peak - v >= thresh:             # 回落够多 → 结算这一段爬升
+            gain += peak - base
+            base = peak = v
+    gain += max(0.0, peak - base)
+    return gain
+
+
+def guess_sport(tr) -> str | None:
+    """按轨迹数据粗判运动形式，返回 TEMPLATE_ORDER 之一；判不出来返回 None（保持原设置）。
+
+    判定优先级：**巡航速度为主**，硬件通道只在速度重叠区做区分，慢速再按累计爬升分徒步/登山。
+    速度取 90 分位而非均值或最大值：均值被等红灯/休息拉低，最大值被 GPS 漂移点拉高。
+
+    ⚠️ 不要拿「有功率」当自行车的判据 —— 现在的手表跑/徒步也会记腕上功率，
+    实轨迹里出现过「登山 FIT 带 power，被误判成骑行」的情况。
+    """
+    if tr is None or not getattr(tr, "has_pos", False):
+        return None
+    n = len(tr.ts)
+    if n < 10 or tr.end - tr.start <= 0:
+        return None
+    step = max(1, n // 400)
+    sp = sorted(tr.speed(tr.ts[i]) * 3.6 for i in range(0, n, step))
+    sp = [v for v in sp if v > 0.0]
+    if not sp:
+        return None
+    p90 = sp[min(len(sp) - 1, int(len(sp) * 0.9))]
+
+    # 1) 巡航速度区间（km/h）
+    if p90 >= 40.0:
+        return "驾驶"
+    if p90 >= 17.0:
+        return "骑行"
+    if p90 >= 7.0:
+        # 7~17 是跑步与慢骑的重叠区：踏频能区分（跑步步频 ~150-190 步/分，骑行 ~60-100 转/分）
+        cad = sorted(c for c in (tr.cadence or []) if c and c > 0)
+        if cad:
+            cm = cad[len(cad) // 2]
+            if cm >= 130.0:
+                return "跑步"
+            if 40.0 <= cm <= 115.0:
+                return "骑行"
+        return "跑步"
+
+    # 2) 慢速（<7 km/h）：徒步 / 登山按累计爬升区分
+    return "登山" if elevation_gain(tr) >= 400.0 else "徒步"
+
+
 def haversine(lat1, lon1, lat2, lon2) -> float:
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -1768,12 +1837,54 @@ def cleanup_workroot(root: str):
         pass
 
 
+def set_proc_paused(proc, paused: bool) -> bool:
+    """挂起 / 恢复一个子进程（「暂停」按钮用）。
+
+    Windows 走 NtSuspendProcess / NtResumeProcess，它对进程内所有线程的挂起计数 ±1，
+    **必须与恢复严格成对调用**，所以只允许调用方（GUI）一处操作，core 自己不再动。
+    其它平台走 SIGSTOP / SIGCONT。
+
+    返回是否成功。失败时调用方应退化为「协作式暂停」—— 等当前阶段自己跑完再停。
+    """
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll")
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            h = k32.OpenProcess(0x0800, False, int(proc.pid))     # PROCESS_SUSPEND_RESUME
+            if not h:
+                return False
+            try:
+                fn = ntdll.NtSuspendProcess if paused else ntdll.NtResumeProcess
+                fn.argtypes = [wintypes.HANDLE]
+                fn.restype = ctypes.c_long
+                return int(fn(h)) >= 0                            # NTSTATUS：非负即成功
+            finally:
+                k32.CloseHandle(h)
+        else:
+            import signal
+            os.kill(proc.pid, signal.SIGSTOP if paused else signal.SIGCONT)
+            return True
+    except Exception:
+        return False
+
+
 def process_video(video: str, track: Track, start_utc: float, out_path: str,
                   ffmpeg: str, ffprobe: str, st: HudStyle, info: VideoInfo | None = None,
                   height="orig", crf=23, preset="veryfast", keep_audio=True,
                   hr: HeartRate | None = None, t_range=None, log=print, progress=None,
-                  cancel=None, workroot: str | None = None, workers: int | None = None):
-    """完整流水线：HUD 帧序列 → ffmpeg 合成 → out_path"""
+                  cancel=None, workroot: str | None = None, workers: int | None = None,
+                  pause=None, ctl: dict | None = None):
+    """完整流水线：HUD 帧序列 → ffmpeg 合成 → out_path
+
+    pause : 由调用方提供的「是否已暂停」判定函数；ctl 为可写字典，ffmpeg 起来后
+            会把子进程句柄放进 ctl["proc"]，供调用方挂起 / 恢复（见 set_proc_paused）。
+    """
     info = info or probe_video(ffprobe, video)
     dw, dh = info.disp_size
     ow, oh = target_size(dw, dh, height)
@@ -1794,11 +1905,24 @@ def process_video(video: str, track: Track, start_utc: float, out_path: str,
         os.makedirs(dm, exist_ok=True)
     if has_zoom:
         os.makedirs(dz, exist_ok=True)
+    def wait_pause():
+        """协作式暂停：HUD 渲染阶段没有可挂起的子进程，只能轮询等到「继续」。"""
+        if not pause:
+            return
+        first = True
+        while pause():
+            if first:
+                log("  [暂停] 已暂停，点『继续』恢复…")
+                first = False
+            time.sleep(0.2)
+        if not first:
+            log("  [继续] 恢复处理。")
+
     try:
-        import time
         log("  生成 HUD 帧 %d 张（%dfps）…" % (n, st["refresh_fps"]))
         t_cost = time.time()
         done = 0
+        wait_pause()
         workers = workers or min(8, max(1, (os.cpu_count() or 4)))
         jobs = [(track, st, start_utc + t0 + i / float(st["refresh_fps"]), ow, oh, hr,
                  os.path.join(dp, "f%06d" % (i + 1)),
@@ -1824,6 +1948,10 @@ def process_video(video: str, track: Track, start_utc: float, out_path: str,
             for i in range(done, n):
                 if cancel and cancel():
                     raise RuntimeError("已取消")
+                if pause and pause():
+                    wait_pause()
+                    if cancel and cancel():
+                        raise RuntimeError("已取消")
                 p, m, z = build_hud(track, st, jobs[i][2], ow, oh, hr)
                 p.save(os.path.join(dp, "f%06d.png" % (i + 1)))
                 if m:
@@ -1869,20 +1997,32 @@ def process_video(video: str, track: Track, start_utc: float, out_path: str,
             cmd += ["-t", "%.3f" % (t1 - t0)]
         cmd += [out_path]
         log("  ffmpeg 合成中（%dx%d, CRF %s）…" % (ow, oh, crf))
+        wait_pause()
+        if ctl is not None:
+            ctl.pop("proc", None)          # 上一个视频的句柄作废，别让 GUI 挂起错人
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="ignore", bufsize=1,
                                 creationflags=_NO_WINDOW)
+        if ctl is not None:
+            ctl["proc"] = proc             # 交给 GUI：由它独占挂起 / 恢复
         buf = ""
         for line in proc.stdout:
             buf += line
             if cancel and cancel():
                 proc.kill()
                 raise RuntimeError("已取消")
+            # 真正挂起由 GUI 完成；进程挂起后这里会阻塞在读取上，恢复后自然继续。
+            # 若挂起失败（极罕见），下面的 sleep 至少不让空转把 CPU 打满。
+            if pause and pause():
+                time.sleep(0.15)
+                continue
             m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
             if m and progress:
                 cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) + t0
                 progress(0.65 + 0.35 * min(1.0, cur / max(t1, 1e-6)))
         proc.wait()
+        if ctl is not None:
+            ctl.pop("proc", None)          # 本视频的 ffmpeg 已结束，句柄不再有效
         if proc.returncode != 0:
             raise RuntimeError("ffmpeg 失败（%d）：\n%s" % (proc.returncode, buf[-1200:]))
         progress and progress(1.0)
