@@ -50,9 +50,13 @@ TV_MAX_ROWS = 18              # 视频浏览框最多显示行数（再富余的
 SLIDER_LEN = 108
 CORNER_TOL = 18.0              # 预览图上“角”的命中半径（像素，会按元素大小自适应）
 EDGE_TOL = 11.0                # 预览图上“边”的命中带宽（像素，会按元素大小自适应）
-SCALE_GAIN = 0.5               # 缩放灵敏度：鼠标移动 1px，元素边缘只跟随 0.5px（越小越稳）
+SCALE_GAIN = 1.0               # 缩放灵敏度：鼠标移动 1px，角/边跟随 1px（1:1 跟手；再大过于灵敏）
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 SHUTDOWN_SECONDS = 60          # “输出完成后关机”的倒计时
+TB_H = 34                      # 自绘标题栏高度：窗口标题与「关于」按钮同处这一行
+TB_BG = "#dfe5ef"              # 标题栏底色（浅色主题）
+TB_FG = "#1c2430"
+BD = "#b9c3d3"                 # 无边框窗口的外描边
 
 APP_NAME = "GPS 轨迹视频叠加工具"
 VERSION = "1.2"                # 显示在窗口标题与「关于本工具」
@@ -66,6 +70,31 @@ try:
     from PIL import Image, ImageDraw, ImageTk
 except Exception:              # pragma: no cover
     ImageTk = None
+
+try:
+    from app_icon import ICON_PNG_B64     # 应用图标（256px PNG 的 base64，随源码/打包一起走）
+except Exception:              # pragma: no cover
+    ICON_PNG_B64 = None
+
+_ICON_CACHE = {}
+
+
+def app_icon_image(size=256):
+    """取应用图标（PIL Image，已缓存）。内嵌 base64，源码运行与打包运行完全一致。"""
+    if Image is None or not ICON_PNG_B64:
+        return None
+    if size in _ICON_CACHE:
+        return _ICON_CACHE[size]
+    try:
+        import base64 as _b64
+        import io as _io
+        im = Image.open(_io.BytesIO(_b64.b64decode(ICON_PNG_B64))).convert("RGBA")
+        if size != im.width:
+            im = im.resize((size, size), Image.LANCZOS)
+        _ICON_CACHE[size] = im
+        return im
+    except Exception:
+        return None
 
 
 def fmt_dur(sec):
@@ -436,10 +465,12 @@ class LayoutSurface:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("%s  v%s" % (APP_NAME, VERSION))
+        root.title("%s v%s" % (APP_NAME, VERSION))
         root.geometry("1260x860")
-        root.minsize(1180, 720)
+        self._minsize = (1180, 720)      # 最大化时要临时解开，回到这里恢复
+        root.minsize(*self._minsize)
         root.configure(bg=BG)
+        self._setup_icon()                # 窗口 / 任务栏 / 标题栏统一图标
         self.q = queue.Queue()
         self.cancel_flag = threading.Event()
         self.pause_flag = threading.Event()   # 置位 = 已暂停（HUD 阶段靠它协作等待）
@@ -460,8 +491,15 @@ class App:
         self.escale = {"panel": [1.0, 1.0], "map": [1.0, 1.0], "zoom": [1.0, 1.0]}
         self.layouts = {}
         self._tpl_manual = False     # 用户手动改过「运动形式」后，不再按轨迹自动识别
+        # 自绘标题栏相关状态
+        self._frameless = False      # 是否已去掉系统标题栏（Windows 下为 True）
+        self._maxed = False
+        self._pre_geo = None
+        self._drag_off = None
+        self._rz = None
 
         self._style_ui()
+        self.body = self._make_shell()    # 内容区父容器：自绘标题栏下面那块
         self._make_vars()
         self._build()
         self._load_layouts()
@@ -556,6 +594,16 @@ class App:
         st.configure("Link.TButton", font=("Microsoft YaHei UI", 9, "underline"),
                      foreground=ACCENT, background=CARD, padding=(2, 1))
         st.map("Link.TButton", background=[("active", CARD)],
+               foreground=[("active", "#1a4fb4")])
+        # 右上角「关于」下拉按钮：贴合浅色背景，悬停时浅蓝底
+        st.configure("About.TMenubutton", font=base, foreground=ACCENT, background=BG,
+                     borderwidth=0, padding=(10, 2), relief="flat")
+        st.map("About.TMenubutton", background=[("active", "#dde8ff")],
+               foreground=[("active", "#1a4fb4")])
+        # 自绘标题栏上的「关于」：底色跟标题栏一致
+        st.configure("Tb.TMenubutton", font=base, foreground=ACCENT, background=TB_BG,
+                     borderwidth=0, padding=(10, 2), relief="flat")
+        st.map("Tb.TMenubutton", background=[("active", "#cfd8e8")],
                foreground=[("active", "#1a4fb4")])
         st.configure("TProgressbar", troughcolor="#dfe5ee", background=ACCENT)
         st.configure("TCombobox", fieldbackground="#ffffff")
@@ -664,18 +712,310 @@ class App:
         """把 'v1.2' / '1.2.3' 之类版本号变成可比较的元组；解析不出数字返回 (0,)。"""
         return tuple(int(x) for x in re.findall(r"\d+", s or "")) or (0,)
 
-    def _build_menu(self):
-        """窗口右上角的「关于」菜单：检查更新 / bug 反馈 / 关于本工具"""
-        opt = dict(bg=CARD, fg=FG, activebackground=ACCENT, activeforeground="#ffffff",
-                   relief="flat", borderwidth=0)
-        mbar = tk.Menu(self.root, tearoff=0, **opt)
-        m = tk.Menu(mbar, tearoff=0, **opt)
+    def _setup_icon(self):
+        """让窗口图标、任务栏图标、标题栏小图标三者统一为同一张图。"""
+        # 1) exe 自带的 app.ico（打包后为 exe 目录；源码运行为脚本目录）
+        try:
+            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            ico = os.path.join(base, "app.ico")
+            if not os.path.exists(ico):
+                ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
+            if os.path.exists(ico):
+                self.root.iconbitmap(default=ico)
+        except Exception:
+            pass
+        # 2) 内嵌 PNG 再设一次（iconphoto 在 Windows 上同时作用于窗口与任务栏）
+        img = app_icon_image(256)
+        if img is not None and ImageTk:
+            try:
+                self._icon_photo = ImageTk.PhotoImage(img)   # 必须持引用，否则被回收
+                self.root.iconphoto(True, self._icon_photo)
+            except Exception:
+                pass
+
+    def _post_about(self):
+        """在「关于」按钮正下方弹出菜单。
+
+        用普通按钮手动弹出，而不是 ttk.Menubutton——后者会在按钮右侧再画一个
+        下拉指示三角，和文案里的「▾」凑成两个三角。
+        """
+        m, b = self.about_menu, self.mb_about
+        try:
+            m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+        finally:
+            m.grab_release()
+
+    # ------------------------------------------------- 自绘标题栏（窗口外壳）
+    def _make_shell(self):
+        """去掉系统标题栏，自己画一条 34px 的标题栏：左边窗口标题，右边「关于」+ 最小化/最大化/关闭。
+
+        这样「关于」才真的与标题同一行——Windows 原生标题栏上放不了自定义控件，
+        Tk 的原生菜单栏又只能贴窗口左上角。
+        任何一步失败就回退：保留系统标题栏，只在内容区顶部放一个右对齐的「关于」按钮。
+        返回内容区的父容器（_build 里所有控件都挂到它下面）。
+        """
+        if os.name != "nt":
+            return self.root
+        try:
+            self.root.overrideredirect(True)
+        except Exception:
+            return self.root
+        self._frameless = True
+        self.root.configure(bg=BD)
+        win = tk.Frame(self.root, bg=BD)
+        win.pack(fill="both", expand=True, padx=1, pady=1)
+        self._build_titlebar(win)
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True)
+        self._add_resizers(win)          # 无边框后要自己补上八向拉伸
+        self.root.after(150, self._taskbar_button)
+        return body
+
+    def _build_titlebar(self, win):
+        bar = tk.Frame(win, bg=TB_BG, height=TB_H)
+        bar.pack(side="top", fill="x")
+        bar.pack_propagate(False)
+        self.tb = bar
+
+        # ---- 左：小图标 + 窗口标题（含版本号）
+        left = tk.Frame(bar, bg=TB_BG)
+        left.pack(side="left", padx=(12, 0))
+        logo_img = app_icon_image(18)
+        if logo_img is not None and ImageTk:
+            self._tb_logo = ImageTk.PhotoImage(logo_img)      # 持引用，避免被 GC
+            logo = tk.Label(left, image=self._tb_logo, bg=TB_BG, borderwidth=0, padx=0, pady=0)
+        else:
+            logo = tk.Canvas(left, width=16, height=16, bg=TB_BG, highlightthickness=0)
+            logo.create_oval(1, 1, 15, 15, fill=ACCENT, outline="")
+            logo.create_text(8, 8, text="G", fill="#ffffff", font=("Microsoft YaHei UI", 8, "bold"))
+        logo.pack(side="left")
+        tk.Label(left, text="%s v%s" % (APP_NAME, VERSION), bg=TB_BG, fg=TB_FG,
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", padx=(8, 0))
+        self.tb_title = left.winfo_children()[-1]
+
+        # ---- 右：关于 ▾ | 最小化 | 最大化/还原 | 关闭
+        right = tk.Frame(bar, bg=TB_BG)
+        right.pack(side="right")
+        self.btn_close = self._tb_btn(right, "✕", self._on_close, danger=True)
+        self.btn_close.pack(side="right", fill="y")
+        self.btn_max = self._tb_btn(right, "□", self._toggle_max)
+        self.btn_max.pack(side="right", fill="y")
+        self.btn_min = self._tb_btn(right, "─", self._minimize)
+        self.btn_min.pack(side="right", fill="y")
+        tk.Frame(right, bg="#b9c3d3", width=1).pack(side="right", fill="y", padx=(6, 4), pady=7)
+        self._about_menu()
+        mb = tk.Button(right, text="关于 ▾", command=self._post_about, bd=0, relief="flat",
+                       bg=TB_BG, fg=ACCENT, font=("Microsoft YaHei UI", 10),
+                       activebackground="#cfd8e8", activeforeground="#1a4fb4",
+                       padx=10, pady=2, takefocus=0, cursor="hand2")
+        mb.pack(side="right", padx=(0, 2), pady=3)
+        self.mb_about = mb
+        self._bind_drag(bar)
+
+    @staticmethod
+    def _tb_btn(parent, text, cmd, danger=False):
+        return tk.Button(parent, text=text, command=cmd, bd=0, relief="flat", takefocus=0,
+                         bg=TB_BG, fg=TB_FG, font=("Microsoft YaHei UI", 10),
+                         width=3, padx=0, pady=0,
+                         activebackground=("#e0483c" if danger else "#cfd8e8"),
+                         activeforeground=("#ffffff" if danger else TB_FG))
+
+    def _bind_drag(self, w):
+        """标题栏整条都可拖动（含上面的图标与文字）；按钮除外，否则双击会误触发最大化。"""
+        if isinstance(w, (tk.Button, ttk.Button, ttk.Menubutton)):
+            return
+        w.bind("<ButtonPress-1>", self._tb_press)
+        w.bind("<B1-Motion>", self._tb_drag)
+        w.bind("<Double-Button-1>", lambda e: self._toggle_max())
+        for c in w.winfo_children():
+            self._bind_drag(c)
+
+    def _tb_press(self, e):
+        self._drag_off = (e.x_root - self.root.winfo_rootx(),
+                          e.y_root - self.root.winfo_rooty())
+
+    def _tb_drag(self, e):
+        if not self._drag_off:
+            return
+        if self._maxed:                       # 最大化状态下拖动 → 先还原，窗口跟到鼠标下
+            self._toggle_max()
+            self._drag_off = (self.root.winfo_width() // 2, 12)
+        self.root.geometry("+%d+%d" % (e.x_root - self._drag_off[0],
+                                        e.y_root - self._drag_off[1]))
+
+    def _minimize(self):
+        """override-redirect 窗口 Tk 自己的 iconify() 不管用，得直接发 WM_SYSCOMMAND/SC_MINIMIZE。"""
+        try:
+            import ctypes
+            hwnd = self._hwnd()
+            if hwnd:
+                self._user32().SendMessageW(ctypes.c_void_p(hwnd), 0x0112, 0xF020, 0)
+                self.root.update_idletasks()
+                if self.root.state() in ("iconic", "withdrawn"):
+                    return
+        except Exception:
+            pass
+        try:
+            self.root.iconify()
+        except Exception:
+            pass
+
+    def _toggle_max(self):
+        if self._maxed:
+            self.root.geometry(self._pre_geo or "1260x860")
+            self._maxed = False
+            self.root.minsize(*self._minsize)
+            self.btn_max.configure(text="□")
+        else:
+            self._pre_geo = self.root.geometry()
+            self.root.minsize(1, 1)        # 工作区可能小于 minsize，先解开否则拉不满
+            x, y, w, h = self._workarea()
+            self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+            self._maxed = True
+            self.btn_max.configure(text="❐")
+
+    def _workarea(self):
+        """屏幕可用区域（排除任务栏）；取不到就退回整屏。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0) \
+                    and r.right > r.left and r.bottom > r.top:
+                return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception:
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _add_resizers(self, win):
+        """无边框后窗口不能靠系统拉伸，这里沿四边四角铺 8 条感应带补回来。"""
+        z = 6
+        spec = (("n", dict(relx=0, rely=0, relwidth=1.0, height=z)),
+                ("s", dict(relx=0, rely=1, relwidth=1.0, height=z, anchor="sw")),
+                ("w", dict(relx=0, rely=0, width=z, relheight=1.0)),
+                ("e", dict(relx=1, rely=0, width=z, relheight=1.0, anchor="ne")),
+                ("nw", dict(relx=0, rely=0, width=z * 2, height=z * 2)),
+                ("ne", dict(relx=1, rely=0, width=z * 2, height=z * 2, anchor="ne")),
+                ("sw", dict(relx=0, rely=1, width=z * 2, height=z * 2, anchor="sw")),
+                ("se", dict(relx=1, rely=1, width=z * 2, height=z * 2, anchor="se")))
+        cur = {"n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+               "w": "sb_h_double_arrow", "e": "sb_h_double_arrow",
+               "nw": "size_nw_se", "se": "size_nw_se", "ne": "size_ne_sw", "sw": "size_ne_sw"}
+        for k, kw in spec:
+            f = tk.Frame(win, bg=BD, cursor=cur[k])
+            f.place(**kw)
+            f.bind("<ButtonPress-1>", lambda e, k=k: self._rz_start(e, k))
+            f.bind("<B1-Motion>", lambda e, k=k: self._rz_do(e, k))
+            f.bind("<ButtonRelease-1>", lambda e: setattr(self, "_rz", None))
+
+    def _rz_start(self, e, k):
+        self._rz = (k, self.root.winfo_rootx(), self.root.winfo_rooty(),
+                    self.root.winfo_width(), self.root.winfo_height(), e.x_root, e.y_root)
+        if self._maxed:                    # 手动拉边 = 退出最大化（几何交给拖拽本身改）
+            self._maxed = False
+            self.root.minsize(*self._minsize)
+            self.btn_max.configure(text="□")
+
+    def _rz_do(self, e, k):
+        if not self._rz or self._rz[0] != k:
+            return
+        _, x0, y0, w0, h0, mx, my = self._rz
+        dx, dy = e.x_root - mx, e.y_root - my
+        x, y, w, h = x0, y0, w0, h0
+        if "e" in k:
+            w = w0 + dx
+        if "s" in k:
+            h = h0 + dy
+        if "w" in k:
+            x, w = x0 + dx, w0 - dx
+        if "n" in k:
+            y, h = y0 + dy, h0 - dy
+        mw, mh = self.root.minsize()
+        w, h = max(mw, w), max(mh, h)
+        if w != w0 or h != h0 or x != x0 or y != y0:
+            self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+    @staticmethod
+    def _user32():
+        """user32 接口声明。
+
+        HWND 在 64 位上是指针：不写 argtypes，ctypes 会按 c_int 传参而截断，
+        结果就是样式设了个寂寞（还不报错）。
+        """
+        import ctypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetParent.argtypes = [ctypes.c_void_p]
+        u.GetParent.restype = ctypes.c_void_p
+        u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.GetWindowLongW.restype = ctypes.c_long
+        u.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        u.SetWindowLongW.restype = ctypes.c_long
+        u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                   ctypes.c_ulonglong, ctypes.c_longlong]
+        u.SendMessageW.restype = ctypes.c_longlong
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SetWindowPos.restype = ctypes.c_int
+        return u
+
+    def _hwnd(self):
+        """真正的顶层窗口句柄。
+
+        Tk 的 toplevel 是「真 HWND 容器 + 内部 frame」，winfo_id() 给的是里面那层
+        （带 WS_CHILD），样式必须改在外层容器上，否则任务栏/最小化都不生效。
+        """
+        try:
+            import ctypes
+            p = self._user32().GetParent(ctypes.c_void_p(self.root.winfo_id()))
+            return int(p) if p else int(self.root.winfo_id())
+        except Exception:
+            return None
+
+    def _taskbar_button(self, n=0):
+        """override-redirect 窗口默认带 WS_EX_TOOLWINDOW（不进任务栏），这里换成 APPWINDOW，
+        并补上最小化/最大化框样式，让自绘的最小化按钮真的能用。
+
+        必须等窗口映射完：没映射时 GetParent 拿不到外层容器，样式会误设到内部 frame 上
+        （那是个 WS_CHILD，对它做 FRAMECHANGED 还会把窗口布局搞坏）。
+        """
+        try:
+            import ctypes
+            u = self._user32()
+            hwnd = self._hwnd()
+            if (not self.root.winfo_viewable()) or (not hwnd) or hwnd == self.root.winfo_id():
+                if n < 12:
+                    self.root.after(200, lambda: self._taskbar_button(n + 1))
+                return
+            h = ctypes.c_void_p(hwnd)
+            st = (u.GetWindowLongW(h, -16) & 0xFFFFFFFF) | 0x00020000 | 0x00010000
+            u.SetWindowLongW(h, -16, ctypes.c_long(st))
+            ex = ((u.GetWindowLongW(h, -20) & 0xFFFFFFFF) | 0x00040000) & ~0x00000080
+            u.SetWindowLongW(h, -20, ctypes.c_long(ex))
+            u.SetWindowPos(h, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+        except Exception:
+            pass
+
+    def _about_menu(self):
+        m = tk.Menu(self.root, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
+                    activeforeground="#ffffff", relief="flat", borderwidth=0)
         m.add_command(label="检查更新…", command=self.do_check_update)
         m.add_command(label="bug 反馈…", command=self.do_feedback)
         m.add_separator()
         m.add_command(label="关于本工具", command=self.do_about)
-        mbar.add_cascade(label="关于", menu=m)
-        self.root.configure(menu=mbar)
+        self.about_menu = m
+        return m
+
+    def _build_menu(self):
+        """回退方案（非 Windows / 去边框失败时）：系统标题栏保留，「关于」放内容区顶部右侧。"""
+        top = tk.Frame(self.body, bg=BG)
+        top.pack(side="top", fill="x")
+        self._about_menu()
+        mb = tk.Button(top, text="关于 ▾", command=self._post_about, bd=0, relief="flat",
+                       bg=BG, fg=ACCENT, font=("Microsoft YaHei UI", 10),
+                       activebackground="#dde8ff", activeforeground="#1a4fb4",
+                       padx=10, pady=2, takefocus=0, cursor="hand2")
+        mb.pack(side="right", padx=(0, 14), pady=(6, 0))
+        self.mb_about = mb
 
     def do_check_update(self):
         self.say("[更新] 正在检查最新版本…")
@@ -771,11 +1111,12 @@ class App:
         win.geometry("+%d+%d" % (self.root.winfo_rootx() + 260, self.root.winfo_rooty() + 180))
 
     def _build(self):
-        self._build_menu()
+        if not self._frameless:
+            self._build_menu()      # 回退：系统标题栏还在，「关于」单独一行放内容区右上
         # 左栏内容已在首屏内完整显示 → 改用普通 Frame，不再套 Canvas、不显示滚动条。
         # 窗口变矮时由 _fit_log 自动压缩日志框来腾空间，而不是出现滚动条。
         # pady=8 与右栏保持一致，两栏上下边缘对齐
-        left = ttk.Frame(self.root)
+        left = ttk.Frame(self.body)
         # 注意：这里先不 pack。右栏宽度固定，必须比左栏先拿到空间，
         # 否则左栏内容一变宽就会把右栏（含 400×225 预览）挤窄。
         self._left = left
@@ -873,7 +1214,8 @@ class App:
         self.log.configure(state="disabled")
 
         # ============ 右栏：2 信息显示设置 → 布局按钮 → 实时预览（右下角） ============
-        right = ttk.Frame(self.root, style="Card.TFrame", width=PREVIEW_W + 110)
+        right = ttk.Frame(self.body, style="Card.TFrame", width=PREVIEW_W + 110)
+        self._right = right
         right.pack_propagate(False)
         right.pack(side="right", fill="y", padx=(8, 8), pady=8)
         left.pack(side="left", fill="both", expand=True, pady=8)   # 右栏排完再排左栏，吃剩余宽度
@@ -1876,7 +2218,12 @@ class App:
 
     # ---------------------------------------------------------------- 信息布局弹窗
     def _open_layout_popup(self):
-        """放大窗口中拖动 / 缩放数值面板与轨迹图；背景用一张视频截图，无需实时预览"""
+        """放大窗口中拖动 / 缩放数值面板与轨迹图。
+
+        性能：主预览已经有一张视频帧和一套 HUD 图层，直接复用即可「秒开」——
+        不再每次另起 ffmpeg 抓帧、也不再强制重建图层（那正是之前卡顿的根因）；
+        随后后台补一张更清晰的截图（1280 宽）替换背景，不影响交互。
+        """
         if not self.track:
             messagebox.showwarning("缺少轨迹", "请先添加并选中轨迹文件，再调整信息布局。")
             return
@@ -1895,7 +2242,8 @@ class App:
         cv.pack(fill="both", expand=True)
         lbl = tk.Label(cv, bg="#15171c", cursor="hand2", borderwidth=0, highlightthickness=0,
                        padx=0, pady=0)
-        surf = LayoutSurface(self, lbl, interactive=True, disp_w=960, disp_h=540)
+        surf = LayoutSurface(self, lbl, interactive=True, disp_w=960, disp_h=540,
+                             placeholder="正在准备预览…")
         self._popup_surf = surf
 
         def relayout(ev=None):
@@ -1904,16 +2252,32 @@ class App:
         cv.bind("<Configure>", relayout)
         win.protocol("WM_DELETE_WINDOW", lambda: (self._popup_close(surf), win.destroy()))
 
-        # 取一张视频截图作背景（无需实时预览），缩到输出画幅以保证比例一致
+        # ① 秒开：复用主预览已有的背景帧 + HUD 图层，开窗即见内容
+        pv = getattr(self, "pvs", None)
+        shown = False
+        if pv is not None and pv.bg is not None:
+            surf.set_bg(pv.bg)
+            key = surf._layer_key(self._pv_seek(v), self.style())
+            if pv.layers is not None and pv.layers_key == key:
+                surf.layers = pv.layers
+                surf.layers_key = key
+            surf.render_layers(force=False)          # 命中图层缓存 → 直接合成
+            surf.assemble()
+            relayout()
+            shown = True
+
+        # ② 后台补一张更清晰的截图（1280 宽）作背景，到了就替换，不影响拖拽
         def grab():
             try:
                 seek = self._pv_seek(v)
                 img = C.grab_frame(self.ffmpeg, v["path"], seek, v["info"], max_w=1280)
                 ow, oh = self._pv_out_size(img)
                 img = img.resize((ow, oh), Image.LANCZOS)
-                self.root.after(0, lambda: (surf.set_bg(img), surf.render_layers(True), relayout()))
+                self.root.after(0, lambda: (win.winfo_exists() and
+                                            (surf.set_bg(img), surf.render_layers(True), relayout())))
             except Exception as e:
-                self.root.after(0, lambda: self.say("[错误] 布局弹窗取帧失败：%s" % e))
+                if not shown:
+                    self.root.after(0, lambda: self.say("[错误] 布局弹窗取帧失败：%s" % e))
         threading.Thread(target=grab, daemon=True).start()
         self.say("[布局] 已打开『信息布局设置』窗口：拖动面板 / 轨迹图即可调整，关闭即保存。")
 
